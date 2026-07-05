@@ -128,6 +128,7 @@ function analyzeProbeResult(probeResult, url) {
     return {
         video: videoCodec,
         audio: audioCodec,
+        duration: parseFloat(format.duration) || 0, // Full runtime in seconds (0 if unknown/live)
         width: videoStream?.width || 0,
         height: videoStream?.height || 0,
         audioChannels: audioStream?.channels || 0, // For Smart Audio Copy

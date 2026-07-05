@@ -39,29 +39,40 @@ router.post('/session', async (req, res) => {
     const settings = await db.settings.get();
     const userAgent = db.getUserAgent(settings);
 
-    try {
-        const session = await transcodeSession.createSession(url, {
-            ffmpegPath,
-            userAgent,
-            seekOffset: seekOffset || 0,
-            hwEncoder: settings.hwEncoder || 'software',
-            maxResolution: settings.maxResolution || '1080p',
-            quality: settings.quality || 'medium',
-            audioMixPreset: settings.audioMixPreset || 'auto', // Audio downmix preset
-            // Upscaling options
-            upscaleEnabled: settings.upscaleEnabled || false,
-            upscaleMethod: settings.upscaleMethod || 'hardware',
-            upscaleTarget: settings.upscaleTarget || '1080p',
-            videoMode: videoMode, // 'copy' or 'encode'
-            videoCodec: videoCodec, // 'h264', 'hevc', etc.
-            audioCodec: audioCodec, // 'aac', 'ac3', etc.
-            audioChannels: audioChannels // number of channels (2=stereo)
-        });
+    const sessionOptions = {
+        ffmpegPath,
+        userAgent,
+        seekOffset: seekOffset || 0,
+        hwEncoder: settings.hwEncoder || 'software',
+        maxResolution: settings.maxResolution || '1080p',
+        quality: settings.quality || 'medium',
+        audioMixPreset: settings.audioMixPreset || 'auto', // Audio downmix preset
+        // Upscaling options
+        upscaleEnabled: settings.upscaleEnabled || false,
+        upscaleMethod: settings.upscaleMethod || 'hardware',
+        upscaleTarget: settings.upscaleTarget || '1080p',
+        videoMode: videoMode, // 'copy' or 'encode'
+        videoCodec: videoCodec, // 'h264', 'hevc', etc.
+        audioCodec: audioCodec, // 'aac', 'ac3', etc.
+        audioChannels: audioChannels // number of channels (2=stereo)
+    };
 
+    try {
+        let session = await transcodeSession.createSession(url, sessionOptions);
         await session.start();
 
         // Wait for playlist to be ready (first segments generated)
-        const ready = await session.waitForPlaylist(15000);
+        let ready = await session.waitForPlaylist(15000);
+
+        // Input-side seek needs HTTP Range support; some providers reject it.
+        // Retry once with the slower output-side seek before giving up.
+        if (!ready && (seekOffset || 0) > 0) {
+            console.warn('[Transcode] Session with input-side seek failed, retrying with output-side seek...');
+            await transcodeSession.removeSession(session.id);
+            session = await transcodeSession.createSession(url, { ...sessionOptions, seekMode: 'output' });
+            await session.start();
+            ready = await session.waitForPlaylist(20000);
+        }
 
         if (!ready) {
             await transcodeSession.removeSession(session.id);

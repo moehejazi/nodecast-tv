@@ -193,9 +193,11 @@ class TranscodeSession extends EventEmitter {
         }
 
         // Input options (common)
+        // Smaller probe window than ffprobe's: the source was already validated
+        // by /api/probe, so don't spend seconds re-analyzing before first output
         args.push(
-            '-probesize', '5000000',
-            '-analyzeduration', '5000000',
+            '-probesize', '2000000',
+            '-analyzeduration', '2000000',
             '-fflags', '+genpts+discardcorrupt',
             '-err_detect', 'ignore_err',
             '-reconnect', '1',
@@ -203,10 +205,18 @@ class TranscodeSession extends EventEmitter {
             '-reconnect_delay_max', '3'
         );
 
+        // Seek before opening input: demuxer-level seek (near-instant on seekable
+        // sources). As an output option this decodes+discards everything before the
+        // seek point, which makes deep seeks (e.g. 1h into a movie) take minutes.
+        // seekMode 'output' is the fallback for providers that reject the HTTP
+        // Range requests input-side seeking needs (route retries with it).
+        if (this.options.seekOffset > 0 && this.options.seekMode !== 'output') {
+            args.push('-ss', String(this.options.seekOffset));
+        }
+
         args.push('-i', this.url);
 
-        // Add seek offset if specified (as output option to avoid Range requests)
-        if (this.options.seekOffset > 0) {
+        if (this.options.seekOffset > 0 && this.options.seekMode === 'output') {
             args.push('-ss', String(this.options.seekOffset));
         }
 
@@ -273,6 +283,7 @@ class TranscodeSession extends EventEmitter {
         args.push(
             '-f', 'hls',
             '-hls_time', String(SEGMENT_DURATION),
+            '-hls_init_time', '1', // Short first segment: playlist ready ~1s in, so playback starts sooner
             '-hls_list_size', '0', // Keep all segments in playlist
             '-hls_flags', 'independent_segments+append_list',
             '-hls_segment_type', 'mpegts',
@@ -557,6 +568,10 @@ class TranscodeSession extends EventEmitter {
         while (Date.now() - startTime < timeoutMs) {
             if (await this.isPlaylistReady()) {
                 return true;
+            }
+            // FFmpeg died - no point polling out the full timeout
+            if (this.status === 'error') {
+                return false;
             }
             await new Promise(resolve => setTimeout(resolve, 200));
         }

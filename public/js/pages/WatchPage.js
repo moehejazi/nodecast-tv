@@ -71,6 +71,14 @@ class WatchPage {
 
         // State
         this.hls = null;
+        // Virtual timeline for transcode sessions: the session's video element
+        // timeline starts at 0 wherever FFmpeg started, so absolute position in
+        // the movie = timelineOffset + video.currentTime
+        this.fullDuration = 0;
+        this.timelineOffset = 0;
+        this.sessionOptions = null;
+        this.seekRestartTimer = null;
+        this.seekRestartInProgress = false;
         this.content = null;
         this.contentType = null; // 'movie' or 'series'
         this.seriesInfo = null;
@@ -413,6 +421,14 @@ class WatchPage {
         // Store the URL for copy functionality
         this.currentUrl = url;
 
+        // Reset virtual timeline state
+        this.fullDuration = 0;
+        this.timelineOffset = 0;
+        this.sessionOptions = null;
+        clearTimeout(this.seekRestartTimer);
+        this.seekRestartInProgress = false;
+        this.seekRestartPending = false;
+
         // Stop any existing playback
         this.stop();
 
@@ -445,36 +461,53 @@ class WatchPage {
                 this.currentStreamInfo = info;
                 this.updateQualityBadge();
 
+                // Real runtime of the file - lets the seek bar span the whole movie
+                // even while FFmpeg has only produced the first segments
+                this.fullDuration = info.duration || 0;
+
                 if (info.needsTranscode || settings.upscaleEnabled) {
                     console.log(`[WatchPage] Auto: Using HLS transcode session (${settings.upscaleEnabled ? 'Upscaling' : 'Incompatible audio/video'})`);
 
-                    // Heuristic: If video is h264/compat, copy video. Usage: Audio fix. 
+                    // Heuristic: If video is h264/compat, copy video. Usage: Audio fix.
                     // BUT: If upscaling is enabled, we MUST encode.
                     const videoMode = (info.video && info.video.includes('h264') && !settings.upscaleEnabled) ? 'copy' : 'encode';
                     const statusText = videoMode === 'copy' ? 'Transcoding (Audio)' : (settings.upscaleEnabled ? 'Upscaling' : 'Transcoding (Video)');
                     const statusMode = settings.upscaleEnabled ? 'upscaling' : 'transcoding';
 
                     this.updateTranscodeStatus(statusMode, statusText);
-                    const playlistUrl = await this.startTranscodeSession(url, {
+                    this.sessionOptions = {
                         videoMode,
-                        seekOffset: this.resumeTime, // Ensure seekOffset is passed
                         videoCodec: info.video,
                         audioCodec: info.audio,
                         audioChannels: info.audioChannels
+                    };
+                    this.timelineOffset = this.resumeTime || 0;
+                    const playlistUrl = await this.startTranscodeSession(url, {
+                        ...this.sessionOptions,
+                        seekOffset: this.resumeTime // Ensure seekOffset is passed
                     });
+                    this.resumeTime = 0; // Session already starts here; don't seek again on metadata
                     this.playHls(playlistUrl);
                     this.setVolumeFromStorage();
                     return;
                 } else if (info.needsRemux) {
-                    // Remux (container swap) currently doesn't use session logic, uses direct stream
-                    // TODO: Move remux to session logic if seeking is needed for TS files
-                    console.log('[WatchPage] Auto: Using remux (.ts container)');
+                    // Remux via HLS session (copy mode) so the file is seekable,
+                    // unlike the old /api/remux pipe which had no duration at all
+                    console.log('[WatchPage] Auto: Using HLS session remux (.ts container)');
                     this.updateTranscodeStatus('remuxing', 'Remux (Auto)');
-                    const finalUrl = `/api/remux?url=${encodeURIComponent(url)}`;
-                    this.video.src = finalUrl;
-                    this.video.play().catch(e => {
-                        if (e.name !== 'AbortError') console.error('[WatchPage] Autoplay error:', e);
+                    this.sessionOptions = {
+                        videoMode: 'copy',
+                        videoCodec: info.video,
+                        audioCodec: info.audio,
+                        audioChannels: info.audioChannels
+                    };
+                    this.timelineOffset = this.resumeTime || 0;
+                    const playlistUrl = await this.startTranscodeSession(url, {
+                        ...this.sessionOptions,
+                        seekOffset: this.resumeTime
                     });
+                    this.resumeTime = 0;
+                    this.playHls(playlistUrl);
                     this.setVolumeFromStorage();
                     return;
                 }
@@ -492,10 +525,13 @@ class WatchPage {
             const statusMode = settings.upscaleEnabled ? 'upscaling' : 'transcoding';
             console.log(`[WatchPage] ${statusText} enabled. Starting session (encode)...`);
             this.updateTranscodeStatus(statusMode, statusText);
+            this.sessionOptions = { videoMode: 'encode' };
+            this.timelineOffset = this.resumeTime || 0;
             const playlistUrl = await this.startTranscodeSession(url, {
-                videoMode: 'encode',
+                ...this.sessionOptions,
                 seekOffset: this.resumeTime
             });
+            this.resumeTime = 0;
             this.playHls(playlistUrl);
             this.setVolumeFromStorage();
             return;
@@ -512,13 +548,16 @@ class WatchPage {
                 const probeRes = await fetch(`/api/probe?url=${encodeURIComponent(url)}&ua=${encodeURIComponent(ua || '')}`);
                 const info = await probeRes.json();
                 videoCodec = info.video;
+                this.fullDuration = info.duration || 0;
             } catch (e) { console.warn('Probe failed for force audio, assuming h264'); }
 
+            this.sessionOptions = { videoMode: 'copy', videoCodec };
+            this.timelineOffset = this.resumeTime || 0;
             const playlistUrl = await this.startTranscodeSession(url, {
-                videoMode: 'copy',
-                videoCodec,
+                ...this.sessionOptions,
                 seekOffset: this.resumeTime
             });
+            this.resumeTime = 0;
             this.playHls(playlistUrl);
             this.setVolumeFromStorage();
             return;
@@ -617,6 +656,9 @@ class WatchPage {
     }
 
     stop() {
+        // Cancel any pending seek-restart
+        clearTimeout(this.seekRestartTimer);
+
         // Stop history tracking and save final progress
         this.stopHistoryTracking();
         this.saveProgress();
@@ -654,15 +696,100 @@ class WatchPage {
         }
     }
 
+    /**
+     * Absolute position in the movie (accounts for transcode session offset)
+     */
+    getAbsoluteTime() {
+        return (this.timelineOffset || 0) + (this.video?.currentTime || 0);
+    }
+
+    /**
+     * Real total runtime: probe duration when known (transcode sessions only
+     * report the produced-so-far length), otherwise the element's duration
+     */
+    getTotalDuration() {
+        if (this.fullDuration > 0) return this.fullDuration;
+        const d = this.video?.duration;
+        return (isFinite(d) && d > 0) ? d : 0;
+    }
+
     skip(seconds) {
-        if (this.video) {
-            this.video.currentTime = Math.max(0, Math.min(this.video.currentTime + seconds, this.video.duration || 0));
-        }
+        this.seekToAbsolute(this.getAbsoluteTime() + seconds);
     }
 
     seek(percent) {
-        if (this.video && this.video.duration) {
-            this.video.currentTime = (percent / 100) * this.video.duration;
+        const total = this.getTotalDuration();
+        if (!total) return;
+        this.seekToAbsolute((percent / 100) * total);
+    }
+
+    /**
+     * Seek to an absolute position in the movie. Within the already-produced
+     * portion this is a normal seek; beyond it, the transcode session is
+     * restarted at the target time (like Plex/Jellyfin).
+     */
+    seekToAbsolute(target) {
+        if (!this.video) return;
+        const total = this.getTotalDuration();
+        target = Math.max(0, total ? Math.min(target, total - 1) : target);
+
+        // Direct playback: the element owns the full timeline
+        if (!this.currentSessionId) {
+            this.video.currentTime = target;
+            return;
+        }
+
+        // Session playback: check if target falls inside what FFmpeg has produced
+        const local = target - (this.timelineOffset || 0);
+        let seekableEnd = 0;
+        try {
+            if (this.video.seekable?.length) {
+                seekableEnd = this.video.seekable.end(this.video.seekable.length - 1);
+            }
+        } catch (e) { /* ignore */ }
+
+        if (local >= 0 && local <= seekableEnd) {
+            this.video.currentTime = local;
+        } else {
+            // Outside the produced range: restart FFmpeg at the target.
+            // Debounced so dragging the slider doesn't spawn a session per tick.
+            this.pendingSeekTarget = target;
+            this.seekRestartPending = true;
+            clearTimeout(this.seekRestartTimer);
+            this.seekRestartTimer = setTimeout(() => this.restartSessionAt(this.pendingSeekTarget), 350);
+
+            // Reflect the jump in the UI immediately
+            this.timeCurrent.textContent = this.formatTime(target);
+            if (total) this.progressSlider.value = (target / total) * 100;
+            this.showLoading();
+        }
+    }
+
+    /**
+     * Kill the current transcode session and start a new one at the given
+     * absolute position in the movie
+     */
+    async restartSessionAt(seconds) {
+        if (this.seekRestartInProgress) return;
+        if (!this.currentUrl || !this.currentSessionId) return;
+
+        this.seekRestartInProgress = true;
+        console.log(`[WatchPage] Seek outside produced range - restarting session at ${Math.floor(seconds)}s`);
+        this.showLoading();
+
+        try {
+            await this.stopTranscodeSession();
+            this.timelineOffset = seconds;
+            const playlistUrl = await this.startTranscodeSession(this.currentUrl, {
+                ...(this.sessionOptions || {}),
+                seekOffset: seconds
+            });
+            this.playHls(playlistUrl);
+        } catch (err) {
+            console.error('[WatchPage] Seek restart failed:', err);
+        } finally {
+            this.seekRestartInProgress = false;
+            this.seekRestartPending = false;
         }
     }
 
@@ -768,18 +895,25 @@ class WatchPage {
     // === UI Updates ===
 
     updateProgress() {
-        if (!this.video || !this.video.duration) return;
+        if (!this.video) return;
+        // Don't fight the UI while a seek-restart is pending/in flight
+        if (this.seekRestartInProgress || this.seekRestartPending) return;
 
-        const percent = (this.video.currentTime / this.video.duration) * 100;
-        this.progressSlider.value = percent;
-        this.timeCurrent.textContent = this.formatTime(this.video.currentTime);
+        const total = this.getTotalDuration();
+        if (!total) return;
+
+        const absolute = this.getAbsoluteTime();
+        const percent = (absolute / total) * 100;
+        this.progressSlider.value = Math.min(100, percent);
+        this.timeCurrent.textContent = this.formatTime(absolute);
+        if (this.timeTotal) this.timeTotal.textContent = this.formatTime(total);
 
         // Show "Up Next" panel early for series (like streaming services do during credits)
         // Only show if auto-play next episode is enabled
         const autoPlayEnabled = this.app?.player?.settings?.autoPlayNextEpisode;
         if (autoPlayEnabled && this.contentType === 'series' && this.seriesInfo && !this.nextEpisodeShowing && !this.nextEpisodeDismissed) {
-            const duration = this.video.duration;
-            const currentTime = this.video.currentTime;
+            const duration = total;
+            const currentTime = absolute;
 
             // Only proceed if we have reliable duration data
             if (isFinite(duration) && duration >= 180 && currentTime >= 120) {
@@ -1387,8 +1521,15 @@ class WatchPage {
 
     hide() {
         // Called when page becomes hidden
-        // Don't stop playback here - allow background playback
         this.cancelNextEpisode();
+
+        // Cut the stream when navigating away - unless the user popped the
+        // video out to Picture-in-Picture, which should survive navigation
+        const inPip = document.pictureInPictureElement === this.video ||
+            this.video?.webkitPresentationMode === 'picture-in-picture';
+        if (!inPip) {
+            this.stop();
+        }
     }
     // ============================================================
     // Watch History Tracking
@@ -1409,8 +1550,8 @@ class WatchPage {
     async saveProgress() {
         if (!this.content || !this.video || this.video.paused) return;
 
-        const progress = Math.floor(this.video.currentTime);
-        const duration = Math.floor(this.video.duration);
+        const progress = Math.floor(this.getAbsoluteTime());
+        const duration = Math.floor(this.getTotalDuration());
 
         if (isNaN(progress) || isNaN(duration) || duration <= 0) return;
 
