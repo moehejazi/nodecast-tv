@@ -103,6 +103,15 @@ class LivePage {
 
     hide() {
         document.removeEventListener('keydown', this.handleKeydown);
+
+        // Cut the live stream when navigating away - unless the user popped
+        // the video out to Picture-in-Picture, which should survive navigation
+        const video = this.app.player?.video;
+        const inPip = video && (document.pictureInPictureElement === video ||
+            video.webkitPresentationMode === 'picture-in-picture');
+        if (this.app.player && !inPip) {
+            this.app.player.stop();
+        }
     }
 }
 
